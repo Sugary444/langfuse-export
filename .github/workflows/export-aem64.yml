@@ -1,0 +1,66 @@
+name: export-langfuse-arm64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - langfuse/langfuse:3.224.3
+          - langfuse/langfuse-worker:3.224.3
+          - clickhouse/clickhouse-server:25.12
+          - redis:7
+          - minio/minio:latest
+    steps:
+      - name: pull arm64
+        run: docker pull --platform linux/arm64 ${{ matrix.image }}
+
+      - name: verify arch
+        run: |
+          arch=$(docker image inspect ${{ matrix.image }} --format '{{.Architecture}}')
+          echo "arch = $arch"
+          if [ "$arch" != "arm64" ]; then
+            echo "::error::${{ matrix.image }} is $arch, not arm64"
+            exit 1
+          fi
+
+      - name: save
+        run: |
+          SAFE=$(echo "${{ matrix.image }}" | sed 's|[/:]|_|g')
+          echo "SAFE=$SAFE" >> $GITHUB_ENV
+          docker save ${{ matrix.image }} | gzip -1 > "$SAFE.tar.gz"
+          ls -lh "$SAFE.tar.gz"
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE }}-arm64
+          path: '*.tar.gz'
+          retention-days: 7
+          compression-level: 0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
