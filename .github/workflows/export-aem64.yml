@@ -22,45 +22,44 @@ jobs:
           - redis:7
           - minio/minio:latest
     steps:
-      - name: pull + save arm64
+      - name: install skopeo
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq skopeo
+
+      - name: export arm64 image
         run: |
           set -euo pipefail
           img="${{ matrix.image }}"
 
-          if ! docker pull --platform linux/arm64 "$img"; then
-            echo "::warning::$img 首次拉取失败，重试一次"
-            sleep 15
-            if ! docker pull --platform linux/arm64 "$img"; then
-              if [ "$img" = "minio/minio:latest" ]; then
-                echo "::warning::minio/minio 拉取失败，改用 quay.io/minio/minio:latest"
-                img="quay.io/minio/minio:latest"
-                docker pull --platform linux/arm64 "$img"
-              else
-                echo "::error::$img 拉取失败"
-                exit 1
-              fi
-            fi
+          # 候选源：minio 的 docker hub 仓库已失效，改走 bitnami / quay
+          if [ "$img" = "minio/minio:latest" ]; then
+            candidates=( "bitnami/minio:latest" "quay.io/minio/minio:latest" )
+          else
+            candidates=( "$img" )
           fi
 
-          SAFE="$(echo "$img" | tr '/:' '_')"
-          echo "SAFE=$SAFE" >> "$GITHUB_ENV"
-          echo "IMG=$img" >> "$GITHUB_ENV"
-          docker save "$img" -o "${SAFE}.tar"
-          ls -lh "${SAFE}.tar"
-
-      - name: verify tar is arm64
-        run: |
-          python3 - "${SAFE}.tar" <<'PY'
-          import tarfile, json, sys
-          with tarfile.open(sys.argv[1]) as tf:
-              m = json.loads(tf.extractfile("manifest.json").read())[0]
-              cfg = json.loads(tf.extractfile(m["Config"]).read())
-          arch = cfg.get("architecture", "")
-          print(f"architecture = {arch}")
-          if arch != "arm64":
-              print(f"!! {sys.argv[1]} 是 {arch}，不是 arm64", file=sys.stderr)
-              sys.exit(1)
-          PY
+          ok=0
+          for c in "${candidates[@]}"; do
+            if [[ "$c" == */* ]]; then
+              src="docker://docker.io/$c"
+            else
+              src="docker://docker.io/library/$c"
+            fi
+            safe="$(echo "$c" | tr '/:' '_')"
+            echo "尝试 $c  <-  $src"
+            if skopeo copy --override-arch arm64 --override-os linux \
+                 "$src" "docker-archive:${safe}.tar:${c}"; then
+              echo "SAFE=$safe" >> "$GITHUB_ENV"
+              echo "IMG=$c" >> "$GITHUB_ENV"
+              ok=1
+              break
+            fi
+            echo "::warning::$c 失败，尝试下一个源"
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::$img 所有候选源导出失败"
+            exit 1
+          fi
+          ls -lh "${safe}.tar"
 
       - name: upload artifact
         uses: actions/upload-artifact@v4
@@ -86,9 +85,8 @@ jobs:
         run: |
           tag="langfuse-arm64-${{ github.run_number }}"
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" \
-              --title "Langfuse ARM64 images ($tag)" \
-              --notes "arm64 镜像 docker save 导出包，用于内网 docker load 导入。"
+            gh release create "$tag" --title "Langfuse ARM64 images ($tag)" \
+              --notes "arm64 镜像导出包（skopeo 生成），用于内网 docker load。minio 若来自 bitnami 源，load 后请相应改镜像名。"
           fi
           if compgen -G "images/*.tar" >/dev/null; then
             gh release upload "$tag" images/*.tar --clobber
