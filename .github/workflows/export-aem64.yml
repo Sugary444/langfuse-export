@@ -2,6 +2,12 @@ name: export-langfuse-arm64
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/export-aem64.yml'
+
+permissions:
+  contents: write
 
 jobs:
   export:
@@ -16,51 +22,75 @@ jobs:
           - redis:7
           - minio/minio:latest
     steps:
-      - name: pull arm64
-        run: docker pull --platform linux/arm64 ${{ matrix.image }}
-
-      - name: verify arch
+      - name: pull + save arm64
         run: |
-          arch=$(docker image inspect ${{ matrix.image }} --format '{{.Architecture}}')
-          echo "arch = $arch"
-          if [ "$arch" != "arm64" ]; then
-            echo "::error::${{ matrix.image }} is $arch, not arm64"
-            exit 1
+          set -euo pipefail
+          img="${{ matrix.image }}"
+
+          if ! docker pull --platform linux/arm64 "$img"; then
+            echo "::warning::$img 首次拉取失败，重试一次"
+            sleep 15
+            if ! docker pull --platform linux/arm64 "$img"; then
+              if [ "$img" = "minio/minio:latest" ]; then
+                echo "::warning::minio/minio 拉取失败，改用 quay.io/minio/minio:latest"
+                img="quay.io/minio/minio:latest"
+                docker pull --platform linux/arm64 "$img"
+              else
+                echo "::error::$img 拉取失败"
+                exit 1
+              fi
+            fi
           fi
 
-      - name: save
-        run: |
-          SAFE=$(echo "${{ matrix.image }}" | sed 's|[/:]|_|g')
-          echo "SAFE=$SAFE" >> $GITHUB_ENV
-          docker save ${{ matrix.image }} | gzip -1 > "$SAFE.tar.gz"
-          ls -lh "$SAFE.tar.gz"
+          SAFE="$(echo "$img" | tr '/:' '_')"
+          echo "SAFE=$SAFE" >> "$GITHUB_ENV"
+          echo "IMG=$img" >> "$GITHUB_ENV"
+          docker save "$img" -o "${SAFE}.tar"
+          ls -lh "${SAFE}.tar"
 
-      - name: upload
+      - name: verify tar is arm64
+        run: |
+          python3 - "${SAFE}.tar" <<'PY'
+          import tarfile, json, sys
+          with tarfile.open(sys.argv[1]) as tf:
+              m = json.loads(tf.extractfile("manifest.json").read())[0]
+              cfg = json.loads(tf.extractfile(m["Config"]).read())
+          arch = cfg.get("architecture", "")
+          print(f"architecture = {arch}")
+          if arch != "arm64":
+              print(f"!! {sys.argv[1]} 是 {arch}，不是 arm64", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.SAFE }}-arm64
-          path: '*.tar.gz'
-          retention-days: 7
-          compression-level: 0
+          name: ${{ env.SAFE }}
+          path: ${{ env.SAFE }}.tar
+          retention-days: 14
 
+  release:
+    needs: export
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: images
+          merge-multiple: true
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="langfuse-arm64-${{ github.run_number }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --title "Langfuse ARM64 images ($tag)" \
+              --notes "arm64 镜像 docker save 导出包，用于内网 docker load 导入。"
+          fi
+          if compgen -G "images/*.tar" >/dev/null; then
+            gh release upload "$tag" images/*.tar --clobber
+          fi
+          gh release view "$tag"
